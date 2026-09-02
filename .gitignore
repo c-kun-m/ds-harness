@@ -3,3 +3,6 @@ dist/
 coverage/
 .env
 *.tsbuildinfo
+
+# Pinned upstream source used only for architecture study and parity checks.
+/deepseek-harness/

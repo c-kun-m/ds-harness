@@ -1,54 +1,144 @@
-# Web 控制台
+# 26：Web 控制台、投影消费与连接恢复
 
-## 目标
+## 本课定位
 
-使用 Vue 3 构建一个只依赖 API 和投影的控制台，展示会话、工具执行、审批、本体决策、长期任务和子 Agent。Web 不成为新的业务状态真源。
+Web 是 Runtime 的观察和交互客户端，不是新的业务真源。它只通过 24 的 typed remotes/snapshot streams 和服务端 Projection 工作；不能在浏览器重新发明 Turn、Goal、权限或本体状态机。
 
-## 前置条件
+框架可用本项目选择的 Vue 3/Pinia，也可以用其他前端；学习重点是连接代次、投影、可恢复交互和纯展示。上游 Client 使用插件化浏览器模块体系，行为合同比框架 API 更重要。
 
-完成 [SDK 与 ACP 接入](25-SDK与ACP接入.md)。
+## 学习目标
 
-## 页面顺序
+- 先建立 connection generation，再加载业务页面；
+- 每个 Store 用 opening snapshot + validated deltas；
+- 丢弃旧 generation 的迟到帧；
+- 对 journal gap/overlap 重新 baseline，不猜状态；
+- 正确展示消息/chunk/tool/approval/outcome-unknown；
+- 让 UI action 调用权威 Remote，不直接修改持久 Store；
+- 对敏感值、超大日志、图片和错误安全降级；
+- 支持刷新/断线/重连而不重复事件。
 
-1. Runtime 连接页：连接状态、版本、健康检查。
-2. Session 列表：工作区、Preset、状态、更新时间、父子关系。
-3. 对话页：用户消息、Assistant 流、Reasoning 折叠、Tool Card、错误和取消。
-4. Composer：发送、排队、steer、取消、Plan/Goal 状态。
-5. 审批和提问面板：风险说明、参数摘要、允许一次、拒绝、关闭。
-6. 本体面板：版本、当前 Fact Snapshot、候选 Action、Policy Decision 和命中规则。
-7. 本体计划页：DAG、节点状态、factRevision、重试、补偿和人工恢复。
-8. 子 Agent/Job 页：树、状态、输出、继续消息和中断。
-9. 设置页：模型、凭据引用、Preset、MCP 和权限；Secret 永不回显。
+## 页面与模块顺序
 
-## 状态管理
+1. Connection/boot：版本、Host facts、连接状态、恢复操作；
+2. Session list/workspace：投影、lineage、状态、更新时间；
+3. Conversation：committed messages、流式临时块、reasoning、tool cards；
+4. Composer：followup/steer/inject/attachment/cancel；
+5. Approval/question：一次决定、撤回/迟到状态；
+6. Todo/Plan/Goal：服务端 projection，pending/armed 明确；
+7. Jobs/Subagent/Workflow：树、输出、阶段、控制权限；
+8. Ontology：version/snapshot/candidate/decision；
+9. Ontology Plan：DAG、execution/fact revision、compensation/blocker；
+10. Settings/inventory：模型、Preset、MCP、permissions；Secret 永不回显。
 
-每个 Pinia Store 先通过 RPC 获取 Snapshot，再应用 cursor notification。Store 记录最后 cursor 和 connection generation；重连后旧 generation 的消息全部丢弃。对话节点由服务端 Session Projection 提供，前端不从任意事件重新推导 Turn 规则。
+可以按模块插件/slot 延迟加载，但一个 entry 加载失败时必须有可诊断启动页；不能出现半个页面悄悄缺安全控件。
+
+## Store 状态模型
+
+每个 Remote store 至少记录：
+
+- connectionGeneration；
+- baseline revision/cursor/range；
+- current projection/entities；
+- stream status/error；
+- optimistic action identity（若有）；
+- pending interaction ids。
+
+流程：打开 stream → 验证 ready/opening snapshot → 原子发布新 generation store → 应用连续 deltas。旧 generation frame 全丢弃；gap/partial overlap 终止当前 reducer并重新 snapshot。不要从“最后一条看起来像什么”猜缺失事件。
+
+## Conversation 投影
+
+- committed message 来自 Session Surface/Projection；
+- assistant chunk 是临时增量，final message 到达后按 identity 合并/替换，不重复显示；
+- reconnect 不依赖 chunk 重放，最终 committed message 是权威；
+- request/step/turn 状态来自服务端投影；
+- outcome-unknown 与 failed/cancelled 分开，显示“先验证副作用”；
+- compaction summary 作为 Surface 节点展示，可跳转审计原事件，但普通用户不加载巨大日志。
 
 ## Tool Card
 
-Tool Card 有 pending、running、approval、completed、failed、cancelled 和 outcome-unknown。渲染由工具名和 `meta.presentation` 选择；未知工具使用通用 JSON/Text 卡。diff、terminal 和 location 等专用视图只读纯展示数据，不发起隐藏副作用。
+状态至少：queued/policy/approval/running/completed/failed/cancelled/outcome-unknown。Card renderer 由 tool identity/稳定 view tag 选择；未知工具使用通用安全文本/JSON。
+
+- presentation 是纯派生，不能触发隐藏副作用；
+- 不把 canonical 大值全放 DOM；
+- diff/terminal/location/image 使用受控引用和尺寸限制；
+- tool args/results 做字段 redaction；
+- Approval 允许一次按钮绑定 request id，结算后禁用，迟到点击不重放决定。
+
+## Composer 与控制
+
+- 显示 followup/steer/inject 的真实区别；
+- 输入提交后先等 receipt，不伪装成已回答；
+- 防重复提交用 client action id/button state，但服务端仍幂等/鉴权；
+- cancel 表示请求收敛，UI 保持 cancelling 直到服务端状态停稳；
+- attachment 批量准入失败不留下半条消息；
+- Plan/Goal/permissions 选择展示 pending/actual，而不是乐观覆盖真值。
 
 ## 本体可解释性
 
-Policy Decision 展示 Action、allow/deny、reason code、规则 ID、本体版本和事实 revision。敏感字段只显示脱敏摘要。用户可以从计划节点跳转到 Tool Call、事实变更和补偿事件，形成完整审计链。
+PolicyDecision 显示 stage、allow/deny、reason、rule ids、ontologyVersion、factRevision、action/tool version和安全摘要。Plan node 可跳到 decision、tool call/result、FactMutation、outbox/commit、postcondition 和 compensation。敏感 evidence 只显示授权 view。
 
-## 手写顺序
+## 安全与性能
 
-1. 用 `create-vue` 建立 TypeScript/Vite 项目，启用 `vue-tsc`。
-2. 实现协议 Client、连接 Store 和 Snapshot + cursor reducer。
-3. 实现 Session 列表和只读对话。
-4. 实现 Composer、流式更新和取消。
-5. 实现审批/问题交互。
-6. 实现本体决策和 DAG。
-7. 实现子 Agent、Job 和设置页面。
-8. 补无障碍、键盘操作、虚拟列表和大日志性能。
+- DOM 文本默认转义，不用不可信 Markdown HTML；
+- 链接/资源 URI 协议 allowlist；
+- CSP、origin/auth/CSRF 按部署；
+- Token/Secret 不进 localStorage/URL/error report；
+- 虚拟列表/分页/journal，避免全量事件进入内存；
+- chunk 合并按 block identity，不丢终态；
+- 关闭页面/切路由 dispose stream/listener；
+- 多标签页操作都由服务端 CAS/owner 决定。
 
-## 测试与完成标准
+## 实现任务
 
-组件测试覆盖 Store reducer、Tool Card 和交互状态；Playwright 覆盖创建 Session、流式回答、工具审批、策略拒绝、取消、重连、计划补偿和子 Agent。完成后刷新浏览器不会丢状态，也不会重复显示已消费通知。
+1. Vue/Vite/TypeScript + generated Remote client；
+2. boot/connection generation/recovery；
+3. reusable snapshot/journal Store reducer；
+4. Session list + Conversation committed/streaming；
+5. Composer/attachment/cancel；
+6. ToolCard/approval/question；
+7. Todo/Plan/Goal/Jobs/Subagent/Workflow；
+8. Ontology decision/DAG audit chain；
+9. settings/inventory/secret handling；
+10. accessibility/keyboard/virtualization；
+11. component/e2e/fault tests。
 
-## DSH 参考
+## 测试矩阵
 
-- [当前 Web 应用](../deepseek-harness/apps/web)
-- [Client Web 包](../deepseek-harness/packages/client/web/README.md)
-- [Host API Proxy](../deepseek-harness/packages/host/apiproxy/README.md)
+| 场景 | 必须观察到 |
+|---|---|
+| opening snapshot + deltas | Store 一致 |
+| reconnect old frame late | 丢弃旧 generation |
+| duplicate/gap/overlap | 完整重复忽略，gap/partial overlap 重载 |
+| chunk→final/reload | 不重复、不丢 committed message |
+| receipt/idle/cancel | UI 状态与真实语义一致 |
+| approval double/late click | 服务端一次决定，UI 不重放 |
+| outcome unknown | 不显示普通 retry 按钮/成功 |
+| projection unavailable/plugin removed | 页面安全降级并解释，不读内部对象 |
+| huge log/result | UI 有界、可分页/引用读取 |
+| sensitive decision/tool | DOM、日志、error report 无原值 |
+| XSS link/Markdown payload | 不执行脚本/危险协议 |
+| stream/page dispose | 无旧 listener/重复通知 |
+| two tabs CAS | 陈旧操作被服务端拒绝并刷新 |
+
+## 源码复盘
+
+- [`packages/client/README.zh.md`](../deepseek-harness/packages/client/README.zh.md) 与 `connection/modules/store/ui-*`；
+- [`packages/client/web/README.zh.md`](../deepseek-harness/packages/client/web/README.zh.md)；
+- [`packages/client/ui-conversation`](../deepseek-harness/packages/client/ui-conversation)、`ui-tool`、`ui-approval`、`ui-goal`、`ui-plan` 等；
+- [`packages/host/webserver/README.zh.md`](../deepseek-harness/packages/host/webserver/README.zh.md)；
+- Web connection/HMR/snapshot stream E2E。
+
+## 完成标准
+
+- 所有业务状态来自 Remote projection；
+- 刷新/重连无重复、无 gap；
+- Tool/Approval/Unknown outcome 语义诚实；
+- 本体审计链可导航且脱敏；
+- 页面卸载无 stream/listener 泄漏；
+- Playwright 从真实 Host 入口通过关键路径。
+
+## 复盘问题
+
+1. 为什么浏览器不能从原始事件自行重建全部业务状态？
+2. chunk 和 committed message 如何避免双显示？
+3. optimistic UI 可以做什么，绝不能成为哪类状态的权威？

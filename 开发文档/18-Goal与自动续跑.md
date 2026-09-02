@@ -1,44 +1,105 @@
-# Goal 与自动续跑
+# 18：持久 Goal 状态、进程内授权与 Goal Round Driver
 
-## 目标
+## 本课定位
 
-让一个 Session 保存一个长期目标，并在用户授权后自动启动有限轮次的同 Session 工作。Goal 状态和自动调度必须拆成两个组件。
+每个 Agent Session 最多一个当前 Goal。Goal service 只拥有持久状态；Round Driver 独立调度同 Session 自动续行。`armed/disarmed` 是进程本地授权，resume/fork/restart 后默认 disarmed，防止恢复即自动产生副作用。
 
-## 前置条件
+## Goal 领域合同
 
-完成 [Plan 模块](17-Plan模块.md)。
+### 持久状态
 
-## GoalService
+- identity、revision、objective；
+- phase：active/paused/blocked/complete；
+- roundsStarted、maxGoalRounds；
+- blocker（blocked 时稳定 lower-kebab code + 人类说明）；
+- created/updated 时间；
+- clear 使用带 revision tombstone；
+- 默认上限可配置（固定上游默认 256），create 可覆盖且必须正安全整数。
 
-Goal 状态包含 ID、revision、objective、phase、blocker、maxRounds、roundsStarted、createdAt 和 updatedAt。支持 create、edit、pause、resume、complete、block 和 clear。所有 mutation 写 `goal/change` 完整快照并使用 CAS。
+### 操作
 
-GoalService 只拥有状态。进程重启、Session resume 和 Fork 后，active phase 可以保留，但自动续跑授权必须默认 disarmed，防止恢复后无人工确认继续产生副作用。
+create、edit、pause、resume、complete、block、clear。所有变更携带精确 `{ id, revision }` CAS；旧 view 拒绝。pause/complete/block/clear disarm；resume 只在有剩余 Round 时接受并清 blocker。
 
-## GoalRoundDriver
+完成 Goal 可被新 Goal 替代；未完成 Goal 需要显式 edit/状态处理/clear，不静默覆盖。
 
-Driver 监听 Goal 变化和 Agent idle。active + armed + 有剩余轮次时，先 flush Goal mutation，再排入一条带轮次信息的 followup。只有该消息真正进入 Step 才增加 roundsStarted。人类输入优先于自动轮次。
+### 持久与非持久
 
-## 终止和异常
+`goal/change` 携带变更后完整 snapshot；Goal/phase/revision/rounds 持久。Activation armed/disarmed 只在进程缓存；每次 session-start/resume/fork 新边界都 disarm，显式 resume 才重新授权。
 
-- complete、pause、block、clear 和达到轮次上限都会 disarm。
-- 用户取消有 Goal 工作的 Turn 时自动 pause，避免马上重新启动。
-- 模型或持久化异常不做无限自动重试；需要显式 resume。
-- 模型自己报告完成仍是提议，关键领域目标应由本体后置条件或独立 evaluator 认证。
+严格 fold 拒绝 revision 不连续、非法 phase、时间倒退（可 clamp 策略）、Round 不连续和畸形 tombstone。第一次 fold 失败后 service fail-closed。
 
-## 手写顺序
+## Goal Round Driver
 
-1. 实现 Goal 事件、投影和 CAS Service。
-2. 实现进程内 armed 状态，明确不持久化。
-3. 实现 idle 监听和轮次预约。
-4. 实现 flush 后二次检查，处理状态变化竞争。
-5. 实现 Goal 工具和用户命令。
-6. 接入可选本体 completion evaluator。
+调度条件：Agent idle + Goal active + armed + 有容量。Driver 没有自己的 maxRounds 配置，避免策略重复。
 
-## 测试与完成标准
+```text
+goal changed/agent idle
+→ reserve { goalId, revision, round = roundsStarted + 1 }
+→ flush Session durability obligation
+→ recheck goal revision/activation/capacity and competing human input
+→ enqueue reserved <goal_round> message
+→ agent/pre-step before/after downstream revalidate claim
+→ 只有 goal-source user/message 真正进入 Step 才计 roundsStarted
+```
 
-覆盖生命周期、过期 revision、轮次上限、人类消息抢占、flush 失败、取消、重启 disarm 和 evaluator 拒绝完成。完成后设置两轮 Goal，Agent 自动运行两次并在上限停下；重启不会自行继续。
+预留本身不消耗 Round；陈旧预留丢弃。人类工作在预留前/准入前到达时优先，自动工作让行。
 
-## DSH 参考
+## 停止与异常
 
-- [Goal 状态](../deepseek-harness/packages/goal/goal/README.md)
-- [Goal Round Driver](../deepseek-harness/packages/goal/goal-round-driver/README.md)
+- phase 非 active、disarmed、容量耗尽时不续行；
+- 上限耗尽记录稳定 `round-limit` blocker；
+- max-tokens、flush/provider error、cancel、plugin unload 停止，不隐式重试；
+- 与 Goal Round 相关的取消暂停/disarm，防止 idle 后立刻复活；
+- unload 关闭准入、disarm、取消在途并等待 driver/Agent 停稳；
+- 已在卸载开始前被 Inbox 接纳的 Round 可能消耗一次，必须记录这项边界。
+
+Goal 完成默认由调用方/模型决定；关键本体 Goal 应增加独立 evaluator/14–15 后置条件认证，而不是修改基础 Goal service。
+
+## 实现任务
+
+1. GoalId/Error/Snapshot/View/Ref；
+2. strict fold、event、tombstone、projection；
+3. GoalService CAS 和 activation cache；
+4. lifecycle session-start disarm；
+5. Driver reserve/flush/recheck/claim guard；
+6. 固定 goal-round prompt 和 message source；
+7. 轮次上限/blocker/异常停用；
+8. Goal tools/commands；
+9. 可选本体 completion evaluator。
+
+## 测试矩阵
+
+| 场景 | 预期 |
+|---|---|
+| create/edit/lifecycle/clear | revision 与合法转移正确 |
+| stale ref | 不覆盖新状态 |
+| resume/fork/restart | Goal 持久但 activation disarmed |
+| reserve 后 human input | 自动 Round 让行且不计数 |
+| flush 失败/等待中 revision 改变 | 不排入陈旧 Round |
+| pre-step downstream 替换/拒绝 | 完整 claim 再验证，未准入不计数 |
+| Round message 准入 | 正数连续 roundsStarted |
+| 上限 | block round-limit，不超预算 |
+| cancel/max-tokens/provider error | disarm/停止，无自动重试 |
+| teardown | 无新 Round，在途停稳 |
+| forged goal message/prompt | invariant 拒绝 |
+| evaluator 拒绝 complete | 基础状态与领域认证边界明确 |
+
+## 源码复盘
+
+- [`packages/goal/goal/README.zh.md`](../deepseek-harness/packages/goal/goal/README.zh.md) 及 `src/domain/fold/runtime/index/invariant`；
+- [`packages/goal/goal-round-driver/README.zh.md`](../deepseek-harness/packages/goal/goal-round-driver/README.zh.md) 及 `src/index/prompt/invariant`；
+- [`packages/goal/tool-goal`](../deepseek-harness/packages/goal/tool-goal)。
+
+## 完成标准
+
+- 状态与调度包/职责分离；
+- resume 默认不自动继续；
+- reserve/claim/revision 竞争测试通过；
+- 只有真正准入的 Goal message 计 Round；
+- 所有异常停止均无无限自动重试。
+
+## 复盘问题
+
+1. 为什么 armed 不持久化？
+2. 预留和准入分开如何防止浪费 Round？
+3. Goal phase 与 Agent status 为什么不能合成一个状态机？

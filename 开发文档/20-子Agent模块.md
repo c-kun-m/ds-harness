@@ -1,58 +1,125 @@
-# 子 Agent 模块
+# 20：Subagent Provider、发布所有权与可继续子级
 
-## 目标
+## 本课定位
 
-实现可替换的 Subagent Provider、Spawn、Fork、一次性运行、可继续会话、层级所有权和控制工具。先完成同进程 Provider，再增加外部进程 Provider。
+Subagent seam 在一个服务下容纳多个具名 provider：进程内 spawn/fork、ACP、SDK、Codex、Claude Code 等。一次性运行和可继续子级是两种不同所有权模型；Provider 必须显式声明能力，不能静默忽略请求覆盖。
 
-## 前置条件
+## 学习目标
 
-完成 [后台 Job 模块](19-后台Job模块.md)。
+- 建立 provider registry/capability preflight；
+- 让 `start()` 只有在真实子 Agent 已存在并发布后才兑现；
+- 区分 one-shot run ownership 与 continuable persistent Session/Activation；
+- 记录版本化 descriptor、lineage、depth 和精确路由；
+- 实现相邻 parent/child 消息、冷恢复、中断和发现；
+- 在启动、发布、取消、provider unload 和 parent teardown 中完全停稳；
+- 将权限/工具范围在创建时固定，子 Agent 内不能自行加宽。
 
-## Provider 合同
+## Provider Registry
 
-`SubagentProvider` 声明 `outputSchema`、`depthLimit`、`toolFilter`、`persona` 和 `continuable` 能力。请求使用某能力而 Provider 不支持时，Service 在启动前拒绝，不能静默忽略。
+Provider 以唯一 name 注册，声明支持：one-shot/continuable、agentOptions（provider/model/reasoning/maxTokens）、structured output、seed/fork、附件等。Service 在任何资源创建前比较请求与能力；不支持即稳定失败。
 
-一次性接口 `start(request)` 返回 `SubagentRun` 和终态 Result。可继续接口只让 Provider 准备新会话 seed；生命周期、后续消息、冷恢复和所有权由统一 `ContinuationManager` 管理，防止每个 Provider 发明一套继续语义。
+provider registration 是 Effect：卸载阻止新 start，但已接受并发布的 run 由调用者拥有，不被 provider disposer 随意撤销。
+
+## One-shot
+
+请求经能力校验、descriptor snapshot、provider setup。`start()` 的发布边界：
+
+- 发布前 provider 拥有所有资源，失败必须回滚停稳；
+- 成功兑现后调用方拥有 SubagentRun；
+- Run 提供 child identity、result Promise、dispose；
+- result 含最终 assistant output、可选结构化值、stop reason 和安全诊断；
+- result 失败按合同兑现/拒绝，不丢 stop reason；
+- dispose 取消剩余工作并等待 child Session/Scope/Agent 完全拆除。
+
+进程内 driver 从父路由/创建选项解析子路由，应用 persona/tool restrictions/structured output 后再发布。结构化输出只在权威最终工具结果成功后提交；捕获后单调 Guard 阻止后续工具；缺必需值的正常结束视为 error，不自动重提示。
 
 ## Spawn 与 Fork
 
-- Spawn 创建空历史子 Session，继承工作目录、模型路由、Permission Preset 和允许的 Preset 策略。
-- Fork 复制父 Session 到最近的闭合 Turn 边界，Header 记录 parentSession 和 seedLength。
-- 两者都写持久 descriptor，记录 provider、mode、label、composition 和 delegationDepth。
-- 默认最大深度为配置值；使用绝对深度而不是“剩余次数”，使重启后仍可验证。
+- Spawn：新 Session，无父对话 seed，但记录 lineage/depth/cwd；
+- Fork：seed 是父会话稳定完成 Turn 前缀，并记录 inherited cut；读取 child 自有最终输出时排除 seed；
+- child depth = parent depth + 1，使用绝对 maxDepth，恢复后仍可验证；
+- descriptor 写入 child 日志，不进入模型历史；
+- descriptor 固定 provider/mode/route，用于 continuable 冷恢复。
 
-## One-shot 与 Continuable
+权限不能在子会话内加宽。若复刻 DSH 进程内驱动器，注意它创建新的扁平组合 Scope，不自动继承父级每个临时工具限制；它把明确的沙箱覆盖与 `approval: never` 固定到 delegated child，并通过 runtime context 告知权限范围不可加宽。本项目若选择“全部继承且只能收窄”，必须写差异和相应安全测试。
 
-One-shot 默认前台等待，显式后台时注册 Job。Continuable 默认可以后台返回子 Session ID，后续 `send_message` 把内容作为下一条 FIFO Turn；它不返回该消息的独立结果，结果在子 Session 中查看。
+## Continuable
 
-## 控制语义
+可继续 child 有持久 Session identity，同一时刻至多一个进程内 Activation：
 
-- `send_message` 只允许父 Agent 给直接 continuable child 发消息，不能进行 mid-turn steering。
-- `interrupt_agent` 允许祖先中断后代当前 Turn，保留排队消息和子 Agent 身份，已发布后代继续运行。
-- `list_agents` 分直接 children 和完整 descendants；列表是快照，实际操作再次鉴权。
+- manager 预留 child id/descriptor；
+- 创建或冷恢复 Session/Agent；
+- 安装 Activation 后提交 prompt；
+- 完成一次 Turn 后 child 可保持可继续 identity；
+- direct parent 后续可发送消息；没有 Activation 时 direct child 可冷恢复；
+- Activation 结算向在线 direct parent 追加一次 runtime 通知。
 
-## 手写顺序
+## 消息与控制
 
-1. 定义 Provider、Capability、Request、Result 和 lifecycle event。
-2. 实现 Provider Registry 和能力预检。
-3. 实现 lineage、depth、descriptor 和父子投影。
-4. 实现 in-process Spawn。
-5. 实现闭合 Turn Fork。
-6. 实现 ContinuationManager、FIFO follow-up、冷恢复和 interrupt。
-7. 实现 Subagent 工具、控制工具和 Job 后台桥接。
-8. 最后实现 out-of-process Provider，并复用 SDK/ACP 协议。
+`sendMessage(sender,target)` 使用精确在线 Agent：sender 可发给 direct continuable child；只有驻留 continuable child 可发给自己的 direct parent。忙 target 使用 steer 到最近 Step，idle target 启动新 Turn。Host/browser queue 是独立认证路径。
 
-## 安全和生命周期
+Parent 可中断活动后代（具体授权层级要固定）；中断当前工作不销毁 child identity。取消收敛期间到达的消息可能排队直到下一唤醒，这个边界需要测试/文档。
 
-子 Agent 工具过滤同时影响可见性和执行。子 Agent 继承的权限只能相同或更窄。父 Agent dispose 时取消并等待其拥有的 continuable 树；一次性外部进程必须经过 TERM/KILL 回收阶梯。Session lineage 只证明关系，不自动授予跨进程活跃所有权。
+`listChildren`/descendant tree 从在线 Session + 可选 persistence 读取，不为发现而加载/恢复 child。快照含 mode、active、lineage；执行操作时重新鉴权。
 
-## 测试与完成标准
+## 交付限制
 
-覆盖能力不支持、深度上限、Spawn 空历史、Fork 闭合前缀、前台结果、后台 ID、FIFO 消息、冷恢复、祖先中断、兄弟越权和递归清理。完成后父 Agent 同时启动两个 child，继续自身工作，再分别发送后续消息并查看各自独立日志。
+- 跨进程 continuable 需要持久 mailbox + lease，核心当前不提供；
+- parent offline 时 child→parent 无持久 mailbox，拒绝而非假装接纳；
+- crash 可能丢失已接受但未写入 child Session 的 prompt；
+- ACP child 可按 provider 只支持 one-shot；
+- lifecycle observer 不能获得 run disposal capability。
 
-## DSH 参考
+## 实现任务
 
-- [Subagent 类型](../deepseek-harness/packages/subagent/subagent/src/types.ts)
-- [Spawn Provider](../deepseek-harness/packages/subagent/subagent-spawn-in-process/README.md)
-- [Fork Provider](../deepseek-harness/packages/subagent/subagent-fork-in-process/README.md)
-- [控制工具](../deepseek-harness/packages/subagent/tool-subagent-control/README.md)
+1. Provider/Capabilities/Request/Result/Run types；
+2. registry + preflight + scoped registration；
+3. descriptor/lineage/depth/fold/invariant；
+4. in-process one-shot driver + publication transaction；
+5. Spawn/Fork seed；
+6. structured output runtime；
+7. ContinuationManager/Activation/cold restore；
+8. adjacent messaging/interrupt/list discovery；
+9. permission/tool composition policy；
+10. model tools/control surface；
+11. out-of-process providers 后置。
+
+## 测试矩阵
+
+| 场景 | 必须观察到 |
+|---|---|
+| provider/capability 不支持 | 创建前失败，无 child |
+| setup/publish 失败 | 所有未发布资源停稳 |
+| start 成功后 provider unload | 已发布 run 按 owner 合同继续/可 dispose |
+| Spawn/Fork | 空/稳定 seed，lineage/cut/depth 正确 |
+| maxDepth | 恢复后仍拒绝超限 |
+| structured output 正常/缺失/后续调用 | 提交点和 Guard 正确 |
+| one-shot cancel/dispose | result 收敛，Session/Agent/Scope 移除 |
+| continuable FIFO/cold restore | identity 不变，消息顺序正确 |
+| busy/idle sendMessage | steer/新 Turn 语义正确 |
+| 非相邻/兄弟/离线 parent | 授权拒绝 |
+| interrupt | 当前工作停，child identity/队列按合同保留 |
+| list discovery | 不激活冷 child，快照与操作二次鉴权 |
+| parent teardown | 拥有的 Activation/child tree 停稳 |
+| 权限加宽尝试 | fail-closed，delegation context 可见 |
+
+## 源码复盘
+
+- [`packages/subagent/subagent/README.zh.md`](../deepseek-harness/packages/subagent/subagent/README.zh.md) 与 [`src`](../deepseek-harness/packages/subagent/subagent/src)；
+- [`packages/subagent/subagent-in-process-driver/README.zh.md`](../deepseek-harness/packages/subagent/subagent-in-process-driver/README.zh.md)；
+- [`subagent-spawn-in-process`](../deepseek-harness/packages/subagent/subagent-spawn-in-process)、[`subagent-fork-in-process`](../deepseek-harness/packages/subagent/subagent-fork-in-process)；
+- tool-subagent/control 和各外部 provider README/tests。
+
+## 完成标准
+
+- 发布前/后 owner 边界可由故障测试证明；
+- Spawn/Fork/one-shot/continuable 行为分开；
+- 消息只能走授权相邻关系；
+- 权限不能从 child 内加宽；
+- teardown 无 Activation、listener、Session owner 或进程残留。
+
+## 复盘问题
+
+1. Provider registration disposer 为什么不能直接取消已发布 Run？
+2. persistent child identity 与 resident Activation 有什么区别？
+3. lineage 为什么不是授权证明？

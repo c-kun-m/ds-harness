@@ -1,37 +1,96 @@
-# Plan 模块
+# 17：Plan Mode 的持久姿态、步骤边界与人工评审
 
-## 目标
+## 本课定位
 
-实现会话级 Plan Mode，支持用户要求 Agent 先调研和提交计划。Plan Mode 是协作状态和 Prompt 指导，不是本体 Action DAG，也不能替代权限、审批和 Guard。
+Plan Mode 是会话级软引导：让 Agent 先探索和提交计划。它不禁用工具，也不替代本体计划、Guard、审批或沙箱。核心状态由日志重放，pending 也是从已记录命令/状态推导，不维护一份不可恢复 UI 内存真相。
 
-## 前置条件
+## 学习目标
 
-完成 [Todo 模块](16-Todo模块.md)。
+- 用 `plan/mode { active }` 全值事件持久状态；
+- 在 idle 与开放 Turn 中正确安排变更提交点；
+- 从投影推导 `{ active, pending }`；
+- 实现 `/plan`、`/plan off` 和带消息/图片的进入；
+- 让 `exit_plan_mode` 始终保持工具目录稳定；
+- 通过一次交互 review 批准退出或继续规划；
+- 明确软提示与硬权限边界。
 
-## 状态和事件
+## 状态提交
 
-`plan/mode { active }` 是整值替换事件。Service 暴露 `get(agent)` 和 `set(agent, active)`；Agent 正在运行时，选择排入下一次 pre-step，空闲时立即写日志。UI 同时展示已提交状态和 pending 选择。
+- 没有开放 Turn：set 可立即 append `plan/mode`；
+- Turn 正在运行：选择保持 pending，直到下一个被接受的 in-turn pre-step，由 Agent Runtime 唯一追加；
+- append 失败不能让内存状态假装已切换；
+- 重复设置同值 no-op；
+- 恢复/fork 从日志重建 active/pending；
+- set/get 依赖 `plan` 和 turnBoundary projection，缺失时显式失败。
 
-## 模型行为
+## Prompt 与工具
 
-active 时加入稳定 Plan Policy section：只读调研、记录假设、列出 API/数据流/失败/测试和验收，最后调用 `exit_plan_mode`。`exit_plan_mode` 始终在工具目录中，非 active 调用返回错误；active 调用通过用户问题服务提交审阅。
+active 时注册/启用稳定 `plan:policy` section；inactive 时不贡献该文本。`exit_plan_mode` 始终注册，避免状态切换改变工具目录和 KV cache；inactive 调用按稳定错误处理。
 
-## 硬限制
+Prompt 只指导“探索、设计、提交计划”，不能成为写权限。只读计划模式要通过 Permission Preset/Tool Guard 硬限制。
 
-如果产品要求 Plan Mode 不写文件，必须由 Permission Preset 或工具 Guard 限制写工具。不能因为 Prompt 写着“不要修改”就把它当安全保证。
+## `/plan` 命令
 
-## 手写顺序
+- `/plan`：请求 active；
+- `/plan <message>`：请求 active，并把去空白文本作为普通 steer/input；
+- 图片与该消息一同提交；
+- `/plan off`：请求 inactive，不发送模型消息；
+- `/plan off` 带图片必须在任何状态变化前拒绝，避免附件丢失；
+- open Turn 中命令选择按 pending 边界生效。
 
-1. 写状态投影和空闲/运行中切换语义。
-2. 写 active Prompt section。
-3. 写 `/plan`、`/plan off` 命令或等价 RPC。
-4. 写 `exit_plan_mode` 和一次性用户审阅。
-5. 写 Web pending 状态和计划审阅卡。
+## 评审退出
 
-## 测试与完成标准
+Agent 以 Markdown（从标题开始）调用 `exit_plan_mode`：
 
-覆盖空闲切换、mid-turn 切换、取消 pending、恢复、Fork 继承、Spawn 默认 inactive、审阅批准/拒绝/关闭，以及软指导不能绕过 Guard。完成后 active 状态跨重启保持一致。
+- 有交互 review：用户 `Approve` 或 `Keep planning` + 可选反馈；
+- Approve 记录静默 pending exit，在下一个 accepted pre-step 提交；当前工具 batch 其余调用仍处于 plan policy；
+- Keep planning 发送反馈继续；
+- 关闭 review/转为普通发言时，通知 Agent 等待下一输入；
+- 没有交互通道或服务 reload 时 fail-closed；`/plan off` 是人工退路。
 
-## DSH 参考
+## 实现任务
 
-- [Plan Mode](../deepseek-harness/packages/plan/plan-mode/README.md)
+1. `plan/mode` event/invariant；
+2. plan + turnBoundary projection；
+3. PlanMode service set/get 和 pending commit；
+4. scoped `plan:policy` section；
+5. `/plan` command 的文本/图片分支；
+6. `exit_plan_mode` tool + review seam；
+7. Web/client projection；
+8. resume/fork/compaction 测试。
+
+## 测试矩阵
+
+| 场景 | 预期 |
+|---|---|
+| idle set/on/off/no-op | 事件和 projection 正确 |
+| mid-Turn set | pending，下一 accepted pre-step 提交 |
+| commit append 失败 | active 不伪改变，Turn 按合同继续 |
+| `/plan message` + image | 模式选择和输入原子接纳 |
+| `/plan off` + image | 状态变化前拒绝 |
+| active/inactive assembly | section 有/无，工具目录稳定 |
+| exit approve | pending exit，当前 batch 不提前失去 policy |
+| keep planning/feedback | 仍 active，反馈进入 Agent |
+| 无 review/reload/abort | 工具 fail-closed，无悬挂 question |
+| resume/fork | active/pending 可由日志重建 |
+| Guard | Plan Prompt 无法绕过写限制 |
+
+## 源码复盘
+
+- [`packages/plan/plan-mode/README.zh.md`](../deepseek-harness/packages/plan/plan-mode/README.zh.md)；
+- [`packages/plan/plan-mode/src/index.ts`](../deepseek-harness/packages/plan/plan-mode/src/index.ts)、`types.ts`、`invariant.ts`；
+- 计划模式命令、projection、review 和工具测试。
+
+## 完成标准
+
+- active/pending 完全由日志投影；
+- mid-Turn 边界无竞态；
+- exit tool 永久存在且评审 fail-closed；
+- 图片命令分支无丢失；
+- 明确 Plan Mode 是软引导。
+
+## 复盘问题
+
+1. 为什么批准退出不立即在当前工具 batch 生效？
+2. 工具目录稳定对缓存和恢复有什么好处？
+3. pending 为什么应该是投影而不是独立内存字段？
